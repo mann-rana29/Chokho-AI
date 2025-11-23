@@ -56,7 +56,7 @@ def filter_and_analyze_detections(results, thresholds: Dict[str,float] , image_w
             threshold = thresholds.get(cls_name,0.5)
 
             if confidence >= threshold:
-                bbox = box.xyxy[0].toList()
+                bbox = box.xyxy[0].tolist()
 
                 area_pixels = calculate_bbox_area(bbox)
                 area_percentage = (area_pixels/image_total_area) * 100
@@ -142,4 +142,56 @@ def root():
 
 @app.post("/detect")
 async def detect_trash(file : UploadFile = File(...), location_sens: int = 5):
-    
+    try:
+        contents = await file.read()
+        image = Image.open(io.BytesIO(contents))
+
+        if image.mode != 'RGB':
+            image = image.convert('RGB')
+
+        img_width , img_height = image.size
+
+        start_time = time.time()
+        results = model(image, verbose = False)
+        inference_time = time.time() - start_time
+
+        detections, total_area , class_areas , image_area = filter_and_analyze_detections(results, CONFIDENCE_THRESHOLDS, img_width, img_height)
+
+        if len(detections) < 1:
+            return{
+                "success" : False
+            }
+
+        severity, breakdown = calculate_severity(detections,total_area,class_areas,image_area, location_sens)
+
+        if severity >= 8:
+            urgency = "URGENT"
+            eta_hours = 13
+            color = "red"
+        elif severity >= 5:
+            urgency = "MEDIUM"
+            eta_hours = 24
+            color = "orange"
+        else:
+            urgency = "LOW"
+            eta_hours = 48
+            color = "yellow"
+
+        return{
+            "success" : True,
+            "detections" : detections,
+            "severity": {
+                "score": severity,
+                "urgency": urgency,
+                "color": color,
+                "estimated_eta_hours": eta_hours,
+                "breakdown": breakdown
+            },
+            "summary": {
+                "total_objects": len(detections),
+                "classes_detected": list(class_areas.keys()),
+            },
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail = str(e))
