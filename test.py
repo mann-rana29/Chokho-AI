@@ -1,5 +1,5 @@
 from ultralytics import YOLO
 
-model = YOLO("best.pt")
+model = YOLO("chokho_ai.pt")
 
-model.predict(source= "44.jpg",show = True , save = True)
+model.predict(source= "34.webp",show = True , save = True)

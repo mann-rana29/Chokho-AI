@@ -1,6 +1,11 @@
 from roboflow import Roboflow
+from dotenv import load_dotenv
+import os
 
-rf = Roboflow(api_key = "WlbcOGXr69ltE40RtlYZ")
+load_dotenv()
+
+ROBOFLOW_API_KEY = os.getenv("ROBOFLOW_API_KEY")
+rf = Roboflow(api_key = ROBOFLOW_API_KEY)
 
 #1
 # project = rf.workspace("azat1").project("intelligentvision")
