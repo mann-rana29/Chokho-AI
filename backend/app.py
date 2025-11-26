@@ -1,6 +1,8 @@
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from typing import List, Dict
+from typing import List, Dict, Optional, Tuple
+from location_service import calculate_location_sens
+from PIL.ExifTags import TAGS, GPSTAGS
 from ultralytics import YOLO
 from PIL import Image
 import io
@@ -124,6 +126,68 @@ def calculate_severity(detections: List[dict], total_area : float, class_areas :
 
     return round(severity,1), breakdown
 
+def get_location_from_exif(image : Image.Image) -> Tuple[Optional[float],Optional[float]]:
+    try:
+        exif_data = image.getexif()
+        if not exif_data:
+            print("No EXIF data found")
+            return None, None
+        
+        gps_info = {}
+        
+        # Method 1: Try IFD (modern PIL) - GPS IFD tag is 34853
+        if hasattr(exif_data, 'get_ifd'):
+            gps_ifd = exif_data.get_ifd(34853)
+            if gps_ifd:
+                for tag_id, value in gps_ifd.items():
+                    tag_name = GPSTAGS.get(tag_id, tag_id)
+                    gps_info[tag_name] = value
+        
+        # Method 2: Fallback to old method if IFD didn't work
+        if not gps_info:
+            for tag, value in exif_data.items():
+                tag_name = TAGS.get(tag, tag)
+                if tag_name == 'GPSInfo' and isinstance(value, dict):
+                    for gps_tag, gps_value in value.items():
+                        gps_tag_name = GPSTAGS.get(gps_tag, gps_tag)
+                        gps_info[gps_tag_name] = gps_value
+
+        if not gps_info:
+            print("No GPS info in EXIF")
+            return None, None
+        
+        print(f"GPS info found: {list(gps_info.keys())}")
+        
+        def convert_to_degrees(value):
+            if value is None:
+                return None
+            # Handle IFDRational or tuple
+            if hasattr(value, '__iter__') and len(value) >= 3:
+                d = float(value[0])
+                m = float(value[1])
+                s = float(value[2])
+                return d + (m / 60.0) + (s / 3600.0)
+            return None
+        
+        lat = convert_to_degrees(gps_info.get('GPSLatitude'))
+        lng = convert_to_degrees(gps_info.get('GPSLongitude'))
+        
+        if lat is None or lng is None:
+            print("Could not convert lat/lng")
+            return None, None
+
+        if gps_info.get('GPSLatitudeRef') == 'S':
+            lat = -lat
+        if gps_info.get('GPSLongitudeRef') == 'W':
+            lng = -lng
+
+        print(f"Extracted GPS: lat={lat}, lng={lng}")
+        return lat, lng
+    except Exception as e:
+        print(f"GPS extraction failed : {e}")
+        import traceback
+        traceback.print_exc()
+        return None, None
 
 def calculate_bbox_area(bbox: List[float]) -> float:
     x1,y1,x2,y2 = bbox
@@ -141,13 +205,36 @@ def root():
     }
 
 @app.post("/detect")
-async def detect_trash(file : UploadFile = File(...), location_sens: int = 5):
+async def detect_trash(file : UploadFile = File(...), latitude: Optional[float] = None, longitude : Optional[float] = None):
     try:
         contents = await file.read()
+        
+        # IMPORTANT: Extract EXIF BEFORE any image processing
+        original_image = Image.open(io.BytesIO(contents))
+        exif_lat, exif_lng = get_location_from_exif(original_image)
+        
+        # Now open again for detection (or reuse)
         image = Image.open(io.BytesIO(contents))
-
+        
         if image.mode != 'RGB':
             image = image.convert('RGB')
+
+        if exif_lat and exif_lng :
+            final_lat ,final_lng = exif_lat, exif_lng
+            gps_source = "EXIF metadata"
+        elif latitude and longitude:
+            final_lat,final_lng = latitude,longitude
+            gps_source = "User provided"
+        else:
+            final_lat,final_lng = None,None
+            gps_source = "Not available"
+
+        if final_lat and final_lng:
+            location_sens, reason, location_info = calculate_location_sens(final_lat,final_lng)
+        else:
+            location_sens = 5
+            reason = "GPS not available - using default (residential)"
+            location_info = None
 
         img_width , img_height = image.size
 
@@ -187,6 +274,17 @@ async def detect_trash(file : UploadFile = File(...), location_sens: int = 5):
                 "estimated_eta_hours": eta_hours,
                 "breakdown": breakdown
             },
+            "location" : {
+                "coordinates":{
+                    "latitude" : final_lat,
+                    "longitude" : final_lng
+                } if final_lat else None,
+                "gps_source" : gps_source,
+                "sensitivity" : location_sens,
+                "reason" : reason,
+                "nearest_landmark" : location_info
+            }
+            ,
             "summary": {
                 "total_objects": len(detections),
                 "classes_detected": list(class_areas.keys()),
@@ -195,3 +293,7 @@ async def detect_trash(file : UploadFile = File(...), location_sens: int = 5):
 
     except Exception as e:
         raise HTTPException(status_code=500, detail = str(e))
+
+@app.get("/s")
+async def sync():
+    return {"message" : "success"}
