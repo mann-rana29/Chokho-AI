@@ -1,15 +1,20 @@
-from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi import FastAPI, File, UploadFile, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from typing import List, Dict, Optional, Tuple
 from location_service import calculate_location_sens
 from PIL.ExifTags import TAGS, GPSTAGS
 from ultralytics import YOLO
 from PIL import Image
+from datetime import datetime
 import io
 import numpy as np
 import time
+import uuid
 
 app = FastAPI(title="Chokho AI API")
+
+# In-memory storage for complaints (will replace with PostgreSQL later)
+complaints_db: List[Dict] = []
 
 app.add_middleware(
     CORSMiddleware,
@@ -205,7 +210,7 @@ def root():
     }
 
 @app.post("/detect")
-async def detect_trash(file : UploadFile = File(...), latitude: Optional[float] = None, longitude : Optional[float] = None):
+async def detect_trash(file : UploadFile = File(...)):
     try:
         contents = await file.read()
         
@@ -222,9 +227,6 @@ async def detect_trash(file : UploadFile = File(...), latitude: Optional[float] 
         if exif_lat and exif_lng :
             final_lat ,final_lng = exif_lat, exif_lng
             gps_source = "EXIF metadata"
-        elif latitude and longitude:
-            final_lat,final_lng = latitude,longitude
-            gps_source = "User provided"
         else:
             final_lat,final_lng = None,None
             gps_source = "Not available"
@@ -264,6 +266,17 @@ async def detect_trash(file : UploadFile = File(...), latitude: Optional[float] 
             eta_hours = 48
             color = "yellow"
 
+        complaints_db.append({
+            "id" : str(uuid.uuid4()),
+            "latitude" : final_lat,
+            "longitude" : final_lng,
+            "severity_score" : severity,
+            "urgency" : urgency,
+            "color" : color,
+            "timestamp" : datetime.now().isoformat(),
+            "status" : "pending"
+        })
+
         return{
             "success" : True,
             "detections" : detections,
@@ -294,6 +307,6 @@ async def detect_trash(file : UploadFile = File(...), latitude: Optional[float] 
     except Exception as e:
         raise HTTPException(status_code=500, detail = str(e))
 
-@app.get("/s")
-async def sync():
-    return {"message" : "success"}
+@app.get("/heatmap")
+async def heatmap():
+    return complaints_db
