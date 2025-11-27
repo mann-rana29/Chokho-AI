@@ -8,7 +8,6 @@ from PIL import Image
 from datetime import datetime
 import io
 import numpy as np
-import time
 import uuid
 
 app = FastAPI(title="Chokho AI API")
@@ -131,18 +130,20 @@ def calculate_severity(detections: List[dict], total_area : float, class_areas :
 
     return round(severity,1), breakdown
 
-def get_location_from_exif(image : Image.Image) -> Tuple[Optional[float],Optional[float]]:
+def get_location_from_exif(image : Image.Image) -> Tuple[Optional[float],Optional[float],Optional[float]]:
     try:
         exif_data = image.getexif()
         if not exif_data:
             print("No EXIF data found")
-            return None, None
+            return None, None, None
         
         gps_info = {}
         
         # Method 1: Try IFD (modern PIL) - GPS IFD tag is 34853
         if hasattr(exif_data, 'get_ifd'):
             gps_ifd = exif_data.get_ifd(34853)
+            exif_ifd = exif_data.get_ifd(34665)
+            timestamp = exif_ifd.get(36867)
             if gps_ifd:
                 for tag_id, value in gps_ifd.items():
                     tag_name = GPSTAGS.get(tag_id, tag_id)
@@ -159,7 +160,10 @@ def get_location_from_exif(image : Image.Image) -> Tuple[Optional[float],Optiona
 
         if not gps_info:
             print("No GPS info in EXIF")
-            return None, None
+            return None, None, None
+
+        if not timestamp:
+            return None,None,None
         
         print(f"GPS info found: {list(gps_info.keys())}")
         
@@ -179,20 +183,22 @@ def get_location_from_exif(image : Image.Image) -> Tuple[Optional[float],Optiona
         
         if lat is None or lng is None:
             print("Could not convert lat/lng")
-            return None, None
+            return None, None , None
 
         if gps_info.get('GPSLatitudeRef') == 'S':
             lat = -lat
         if gps_info.get('GPSLongitudeRef') == 'W':
             lng = -lng
 
+        photo_datetime = datetime.strptime(timestamp, "%Y:%m:%d %H:%M:%S")
+
         print(f"Extracted GPS: lat={lat}, lng={lng}")
-        return lat, lng
+        return lat, lng , photo_datetime
     except Exception as e:
         print(f"GPS extraction failed : {e}")
         import traceback
         traceback.print_exc()
-        return None, None
+        return None, None , None
 
 def calculate_bbox_area(bbox: List[float]) -> float:
     x1,y1,x2,y2 = bbox
@@ -216,7 +222,7 @@ async def detect_trash(file : UploadFile = File(...)):
         
         # IMPORTANT: Extract EXIF BEFORE any image processing
         original_image = Image.open(io.BytesIO(contents))
-        exif_lat, exif_lng = get_location_from_exif(original_image)
+        exif_lat, exif_lng , curr_time = get_location_from_exif(original_image)
         
         # Now open again for detection (or reuse)
         image = Image.open(io.BytesIO(contents))
@@ -224,12 +230,31 @@ async def detect_trash(file : UploadFile = File(...)):
         if image.mode != 'RGB':
             image = image.convert('RGB')
 
-        if exif_lat and exif_lng :
+        if exif_lat and exif_lng:
             final_lat ,final_lng = exif_lat, exif_lng
             gps_source = "EXIF metadata"
         else:
-            final_lat,final_lng = None,None
-            gps_source = "Not available"
+            return{
+                "success" : False,
+                "tag" : "NoLocationError",
+                "reason" : "No location (EXIF) metadata founded from your uploaded image. Kindly click image directly from your device and upload it."
+            }
+
+        if curr_time:
+            time_diff = datetime.now() - curr_time
+        else:
+            return{
+                "success" : False,
+                "tag" : "NoTimestampError",
+                "reason" : "Timestamp metadata is missing in your uploaded image. Kindly click image directly from your device and upload it."
+            }
+        
+        if time_diff.total_seconds() > 48*3600:
+            return{
+                "success" : False,
+                "tag": "48HourError",
+                "reason" : "This image is not eligible because it was clicked more than 48 hours ago. Kindly click image directly from your device or upload a recently clicked image."
+            }
 
         if final_lat and final_lng:
             location_sens, reason, location_info = calculate_location_sens(final_lat,final_lng)
@@ -240,15 +265,15 @@ async def detect_trash(file : UploadFile = File(...)):
 
         img_width , img_height = image.size
 
-        start_time = time.time()
         results = model(image, verbose = False)
-        inference_time = time.time() - start_time
 
         detections, total_area , class_areas , image_area = filter_and_analyze_detections(results, CONFIDENCE_THRESHOLDS, img_width, img_height)
 
         if len(detections) < 1:
             return{
-                "success" : False
+                "success" : False,
+                "tag" : "NoTrashError",
+                "reason" : "No trash detected in your uploaded image."
             }
 
         severity, breakdown = calculate_severity(detections,total_area,class_areas,image_area, location_sens)
@@ -279,6 +304,7 @@ async def detect_trash(file : UploadFile = File(...)):
 
         return{
             "success" : True,
+            "tag" : None,
             "detections" : detections,
             "severity": {
                 "score": severity,
@@ -291,7 +317,7 @@ async def detect_trash(file : UploadFile = File(...)):
                 "coordinates":{
                     "latitude" : final_lat,
                     "longitude" : final_lng
-                } if final_lat else None,
+                },
                 "gps_source" : gps_source,
                 "sensitivity" : location_sens,
                 "reason" : reason,
